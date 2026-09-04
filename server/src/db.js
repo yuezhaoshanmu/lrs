@@ -1,9 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import process from 'node:process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new DatabaseSync(path.join(__dirname, '../werewolf.db'));
+console.log('[server] initializing database...');
+const sqlitePath = path.join(__dirname, '../werewolf.db');
+console.log(`[db] sqlite path: ${sqlitePath}`);
+const db = new DatabaseSync(sqlitePath);
 db.exec('PRAGMA foreign_keys = ON');
 db.exec(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS roles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, canonical_name TEXT, aliases TEXT, camp TEXT NOT NULL, category TEXT, sub_category TEXT, description TEXT NOT NULL, short_description TEXT, skill_description TEXT, win_condition TEXT, action_phase TEXT, action_order INTEGER, target_type TEXT, max_uses TEXT, can_target_dead INTEGER DEFAULT 0, can_target_self INTEGER DEFAULT 0, is_awakening INTEGER DEFAULT 0, is_limited INTEGER DEFAULT 0, is_easter_egg INTEGER DEFAULT 0, is_collaboration INTEGER DEFAULT 0, version TEXT, source_name TEXT, source_url TEXT, source_date TEXT, verified_at TEXT, verification_status TEXT DEFAULT 'UNVERIFIED', icon TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT);
@@ -21,4 +25,111 @@ CREATE TABLE IF NOT EXISTS death_events (id INTEGER PRIMARY KEY AUTOINCREMENT, g
 CREATE TABLE IF NOT EXISTS game_events (id INTEGER PRIMARY KEY AUTOINCREMENT, game_id INTEGER NOT NULL, actor_player_id INTEGER, target_player_id INTEGER, event_type TEXT NOT NULL, description TEXT, day_number INTEGER, phase TEXT, metadata TEXT, created_at TEXT NOT NULL, created_by INTEGER, FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE);`);
 db.exec(`CREATE TABLE IF NOT EXISTS role_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, role_id INTEGER NOT NULL, version_name TEXT NOT NULL, skill_description TEXT, rule_description TEXT, source_url TEXT, source_name TEXT, effective_date TEXT, is_current INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, FOREIGN KEY(role_id) REFERENCES roles(id) ON DELETE CASCADE);`);
 db.transaction = (fn) => (...args) => { db.exec('BEGIN'); try { const result = fn(...args); db.exec('COMMIT'); return result; } catch (e) { db.exec('ROLLBACK'); throw e; } };
+
+// Supabase is used as the durable store while SQLite keeps the existing synchronous
+// query API working. This also gives local development a useful offline fallback.
+const configuredSupabaseUrl = process.env.SUPABASE_URL || 'https://dwiepfpenidfmbumisxo.supabase.co';
+const supabaseUrl = configuredSupabaseUrl.replace(/\/rest\/v1\/?$/i, '').replace(/\/$/, '');
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY;
+// The previous whole-table mirror targets the legacy bigint schema. Keep it
+// available for migrations, but never run it implicitly against the new UUID
+// Auth schema.
+const remoteEnabled = Boolean(supabaseKey && process.env.SUPABASE_LEGACY_SYNC === 'true');
+const syncOrder = ['users','roles','games','players','game_roles','player_roles','badges','badge_events','death_events','game_events','role_versions'];
+let syncQueue = Promise.resolve();
+const rawPrepare = db.prepare.bind(db);
+
+const remoteRequest = async (table, init = {}) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  const response = await fetch(`${supabaseUrl}/rest/v1/${table}${init.query || ''}`, {
+    ...init,
+    signal: controller.signal,
+    headers: {
+      apikey: supabaseKey,
+      Authorization: `Bearer ${supabaseKey}`,
+      'Content-Type': 'application/json',
+      ...(init.headers || {})
+    }
+  }).finally(() => clearTimeout(timeout));
+  if (!response.ok) throw new Error(`Supabase ${table}: ${response.status} ${await response.text()}`);
+  return response.status === 204 ? null : response.json();
+};
+
+const localRows = table => rawPrepare(`SELECT * FROM ${table}`).all();
+const replaceRemoteSafe = async table => {
+  const rows = localRows(table);
+  await remoteRequest(table, { method: 'DELETE', query: '?id=not.is.null', headers: { Prefer: 'return=minimal' }, body: undefined });
+  if (rows.length) await remoteRequest(table, { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) });
+};
+const pushTable = async (table, sql, args) => {
+  if (/^\s*DELETE\b/i.test(sql)) {
+    const where = sql.match(/\bWHERE\s+([\w]+)\s*=\s*\?/i);
+    if (where && args.length) {
+      await remoteRequest(table, { method: 'DELETE', query: `?${where[1]}=eq.${encodeURIComponent(args[0])}`, headers: { Prefer: 'return=minimal' } });
+      return;
+    }
+  }
+  const rows = localRows(table);
+  if (rows.length) await remoteRequest(table, { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }, body: JSON.stringify(rows) });
+};
+const syncTableWithFilter = (table, sql, args) => {
+  if (!remoteEnabled) return;
+  syncQueue = syncQueue.then(() => pushTable(table, sql, args)).catch(error => console.warn(`[supabase] ${error.message}`));
+};
+
+// Wrap mutations only; reads remain synchronous and continue to use the local cache.
+db.prepare = sql => {
+  const statement = rawPrepare(sql);
+  if (/^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql)) {
+    const match = sql.match(/^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([\w]+)/i);
+    const table = match?.[1];
+    return {
+      run(...args) {
+        const result = statement.run(...args);
+        if (table) syncTableWithFilter(table, sql, args);
+        return result;
+      },
+      get(...args) { return statement.get(...args); },
+      all(...args) { return statement.all(...args); }
+    };
+  }
+  return statement;
+};
+
+const importRemote = async () => {
+  if (!remoteEnabled) return;
+  const remoteData = new Map();
+  let hasRemoteData = false;
+  let fetchFailed = false;
+  for (const table of syncOrder) {
+    try {
+      const remoteRows = await remoteRequest(table, { method: 'GET', headers: { Prefer: 'count=exact' } });
+      remoteData.set(table, remoteRows || []);
+      hasRemoteData ||= Boolean(remoteRows?.length);
+    } catch (error) {
+      fetchFailed = true;
+      console.warn(`[supabase] startup sync skipped for ${table}: ${error.message}`);
+    }
+  }
+  if (fetchFailed) return;
+  if (hasRemoteData) {
+    // Clear children first to respect the foreign-key graph, then restore in order.
+    for (const table of [...syncOrder].reverse()) rawPrepare(`DELETE FROM ${table}`).run();
+    for (const table of syncOrder) {
+      for (const row of remoteData.get(table) || []) {
+        const keys = Object.keys(row);
+        rawPrepare(`INSERT OR REPLACE INTO ${table} (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(...Object.values(row));
+      }
+    }
+  } else {
+    // First run: publish an existing local seed/database to Supabase.
+    for (const table of syncOrder) if (localRows(table).length) await replaceRemoteSafe(table);
+  }
+};
+
+if (remoteEnabled) await importRemote();
+
+console.log('[server] database ready');
+
 export default db;
