@@ -1,6 +1,6 @@
 {
   "name": "werewolf-platform",
   "private": true,
-  "scripts": {"dev":"concurrently \"npm:dev:server\" \"npm:dev:client\"","dev:server":"npm --prefix server run start","dev:client":"npm --prefix client run dev","build":"npm --prefix client run build","seed":"npm --prefix server run seed"},
+  "scripts": {"dev":"concurrently \"npm:dev:server\" \"npm:dev:client\"","dev:server":"npm --prefix server run start","dev:client":"npm --prefix client run dev","build":"npm ci --prefix client --include=dev && npm --prefix client run build","seed":"npm --prefix server run seed"},
   "devDependencies":{"concurrently":"^9.1.0"}
 }
