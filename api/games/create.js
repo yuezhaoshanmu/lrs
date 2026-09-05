@@ -10,7 +10,7 @@ export default async function handler(req, res) {
     const { name, playerCount, roles = [] } = req.body || {};
     if (typeof name !== 'string' || name.trim().length < 2 || !Number.isInteger(playerCount) || playerCount < 4 || playerCount > 30 || !Array.isArray(roles)) return json(res, 400, { error: '牌局配置不合法' });
     if (roles.reduce((s, r) => s + Number(r.quantity || 0), 0) !== playerCount) return json(res, 400, { error: `身份牌数量需为 ${playerCount}` });
-    const { error: profileError } = await supabase.from('profiles').upsert({ id: user.id, username: String(user.user_metadata?.username || user.email?.split('@')[0] || '夜行者').slice(0, 40), updated_at: now() }, { onConflict: 'id' });
+    const { error: profileError } = await supabase.from('profiles').upsert({ id: user.id, username: user.username }, { onConflict: 'id' });
     if (profileError) throw profileError;
     const ids = [...new Set(roles.filter(r => Number(r.quantity) > 0).map(r => Number(r.roleId)))];
     const { data: valid, error: roleError } = await supabase.from('roles').select('id').in('id', ids).eq('is_active', true); if (roleError) throw roleError;

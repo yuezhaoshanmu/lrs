@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import crypto from 'node:crypto';
 
 const url = (process.env.SUPABASE_URL || '').replace(/\/rest\/v1\/?$/i, '').replace(/\/$/, '');
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -10,12 +11,18 @@ export const method = (req, res, allowed) => {
   return true;
 };
 export const bearer = req => String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+export const hashToken = token => crypto.createHash('sha256').update(String(token)).digest('hex');
+export const createSessionToken = () => crypto.randomBytes(32).toString('base64url');
+export const sessionExpiry = () => new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString();
 export async function userFromRequest(req) {
   if (!supabase) return null;
   const token = bearer(req);
   if (!token) return null;
-  const { data, error } = await supabase.auth.getUser(token);
-  return error ? null : data?.user || null;
+  const { data: session, error } = await supabase.from('sessions').select('user_id,expires_at').eq('token', hashToken(token)).gt('expires_at', new Date().toISOString()).maybeSingle();
+  if (error || !session?.user_id) return null;
+  const { data: profile, error: profileError } = await supabase.from('profiles').select('id,username,avatar_url,user_type,created_at').eq('id', session.user_id).maybeSingle();
+  if (profileError || !profile) return null;
+  return { id: profile.id, username: profile.username, profile, session };
 }
 export async function requireUser(req, res) {
   const user = await userFromRequest(req);

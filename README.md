@@ -20,13 +20,24 @@ npm run dev
 
 不要把 service role key 暴露给浏览器或提交到 git。`server/.env` 已被 `.gitignore` 忽略。
 
+## 用户名认证
+
+执行 [`supabase_schema.sql`](./supabase_schema.sql) 后，使用 `POST /api/auth/register`
+或 `POST /api/auth/login` 提交 `{ "username": "..." }`。接口返回随机会话 token，
+前端将其保存为 `night_session_token`，后续请求通过 `Authorization: Bearer <token>`
+认证；`GET /api/auth/me` 用于刷新页面后恢复用户。会话有效期为 30 天，数据库只保存
+token 的 SHA-256 哈希。旧 Supabase Auth 用户及其 profiles 会被保留并可继续使用用户名登录。
+
+Supabase Auth 邮箱/密码不再参与应用登录；如果项目没有其他用途，可在 Supabase
+Dashboard 中关闭 Email provider。服务端必须配置 `SUPABASE_SERVICE_ROLE_KEY`，不可暴露给浏览器。
+
 ## 使用流程
 
 打开首页即可创建或加入牌局。法官创建后获得一次性法官链接和邀请码；玩家输入邀请码与 2-20 个字符的姓名即可获得临时座位会话。人数满足后法官点击“开始抽牌”，玩家只能查看自己的身份，法官可查看完整分配、重新洗牌、管理警徽、记录状态并结束牌局。
 
 ## 已实现
 
-Supabase Auth 邮箱注册/登录/退出、自动 Session 恢复、profiles 用户中心、UUID 云端牌局与角色分配、Postgres RLS、players/games Realtime、服务端 `crypto.randomInt` 安全洗牌、最小权限的我的身份接口，以及旧 SQLite/judge/player Token 兼容路径。
+用户名 token 注册/登录/退出、自动会话恢复、profiles 用户中心、UUID 云端牌局与角色分配、Postgres RLS、players/games Realtime（含轮询兜底）、服务端 `crypto.randomInt` 安全洗牌、最小权限的我的身份接口，以及旧 SQLite/judge/player Token 兼容路径。
 
 ## 已知限制
 

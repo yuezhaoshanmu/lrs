@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   try {
     const { inviteCode, nickname } = req.body || {};
     if (typeof inviteCode !== 'string' || typeof nickname !== 'string' || nickname.trim().length < 2 || nickname.trim().length > 20) return json(res, 400, { error: '请输入2-20个字符的玩家姓名' });
-    await supabase.from('profiles').upsert({ id: user.id, username: String(user.user_metadata?.username || user.email?.split('@')[0] || '夜行者').slice(0, 40) }, { onConflict: 'id' });
+    await supabase.from('profiles').upsert({ id: user.id, username: user.username }, { onConflict: 'id' });
     const { data: game, error } = await supabase.from('games').select('*').eq('invite_code', inviteCode.trim().toUpperCase()).maybeSingle(); if (error) throw error;
     if (!game) return json(res, 404, { error: '邀请码不存在' }); if (!['open', 'WAITING'].includes(game.status)) return json(res, 400, { error: '牌局已开始或结束' });
     const { data: players, error: pe } = await supabase.from('players').select('*').eq('game_id', game.id).order('seat_number'); if (pe) throw pe;

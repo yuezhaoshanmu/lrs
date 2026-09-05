@@ -14,12 +14,45 @@ do $$ begin
 end $$;
 
 create table if not exists profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
+  id uuid primary key,
   username text not null check (char_length(username) between 2 and 40),
   avatar_url text,
   user_type text not null default 'player' check (user_type in ('judge','player')),
   created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
+-- Username sessions are independent of Supabase Auth. Keep existing Auth users
+-- and profiles, but remove the old FK so new username-only accounts can exist.
+alter table if exists profiles drop constraint if exists profiles_id_fkey;
+with duplicates as (
+  select id, username, row_number() over (partition by username order by created_at, id) as duplicate_rank
+  from public.profiles
+)
+update public.profiles p
+set username = left(p.username || '-' || replace(substr(p.id::text, 1, 8), '-', ''), 40)
+from duplicates d
+where p.id = d.id and d.duplicate_rank > 1;
+create unique index if not exists profiles_username_unique on profiles(username);
+-- Compatibility migration: keep existing Supabase Auth users addressable by a
+-- username while allowing new username-only profiles without auth.users rows.
+do $$ begin
+  if to_regclass('auth.users') is not null then
+    insert into public.profiles (id, username)
+    select u.id,
+      left(coalesce(nullif(u.raw_user_meta_data->>'username',''), split_part(u.email,'@',1), '夜行者'), 40)
+    from auth.users u
+    where not exists (select 1 from public.profiles p where p.id = u.id)
+      and not exists (select 1 from public.profiles p where p.username = left(coalesce(nullif(u.raw_user_meta_data->>'username',''), split_part(u.email,'@',1), '夜行者'), 40));
+  end if;
+end $$;
+create table if not exists sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  token text unique not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+create index if not exists sessions_user_id_idx on sessions(user_id);
+create index if not exists sessions_expires_at_idx on sessions(expires_at);
 create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path = public as $$
 begin
   insert into public.profiles (id, username) values (new.id, coalesce(nullif(new.raw_user_meta_data->>'username',''), split_part(new.email,'@',1), '夜行者')) on conflict (id) do nothing;
@@ -63,6 +96,7 @@ create table if not exists player_roles (
 
 alter table profiles enable row level security; alter table games enable row level security; alter table players enable row level security;
 alter table game_roles enable row level security; alter table player_roles enable row level security; alter table roles enable row level security;
+alter table sessions enable row level security;
 create or replace function public.is_game_owner(target_game uuid) returns boolean language sql stable security definer set search_path=public as $$
   select exists(select 1 from games where id=target_game and owner_id=auth.uid());
 $$;

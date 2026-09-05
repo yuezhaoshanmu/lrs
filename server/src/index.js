@@ -27,8 +27,8 @@ app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173', cre
 app.use(express.json());
 app.use(cookieParser());
 app.use('/role-cards', express.static(path.join(projectRoot, 'client/public/role-cards'), { fallthrough: false }));
-// Supabase-authenticated requests are handled by the cloud router. Requests
-// without a bearer token fall through to the legacy SQLite-compatible API.
+// Username-session requests are handled by the cloud router. Requests without
+// a bearer token fall through to the legacy SQLite-compatible API.
 app.use('/api', cloudRouter);
 const now = () => new Date().toISOString();
 const token = () => crypto.randomBytes(32).toString('base64url');

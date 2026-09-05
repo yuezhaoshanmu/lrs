@@ -5,7 +5,7 @@ import db from './db.js';
 import {
   supabaseAdmin,
   supabaseConfigured,
-  verifySupabaseToken
+  verifySessionToken
 } from './supabase.js';
 
 const router = express.Router();
@@ -51,6 +51,10 @@ const roleView = role => role && ({
 const cloudRequest = (req, res, next) => {
   // Cloud routes are selected by a Supabase bearer token. Legacy token/cookie
   // requests continue through the SQLite handlers below.
+  if ((req.path === '/auth/register' || req.path === '/auth/login')) {
+    if (!supabaseConfigured || !supabaseAdmin) return res.status(503).json({ error: 'Supabase 尚未配置' });
+    return next();
+  }
   if (!supabaseConfigured || !supabaseAdmin || !bearer(req)) return next('router');
   const gamePath = req.path.match(/^\/games\/([^/]+)/);
   if (gamePath && !['join'].includes(gamePath[1]) && !isUuid(gamePath[1])) return next('router');
@@ -59,7 +63,7 @@ const cloudRequest = (req, res, next) => {
 
 const auth = async (req, res, next) => {
   if (!supabaseConfigured || !supabaseAdmin) return res.status(503).json({ error: 'Supabase 尚未配置' });
-  const user = await verifySupabaseToken(bearer(req));
+  const user = await verifySessionToken(bearer(req));
   if (!user) return res.status(401).json({ code: 'AUTH_REQUIRED', error: '请先登录' });
   req.authUser = user;
   next();
@@ -67,8 +71,40 @@ const auth = async (req, res, next) => {
 
 router.use(cloudRequest);
 
+const sessionToken = () => crypto.randomBytes(32).toString('base64url');
+const tokenHash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+const sessionExpiry = () => new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString();
+router.post('/auth/register', async (req, res, next) => {
+  try {
+    const username = String(req.body?.username || '').normalize('NFKC').trim();
+    if (username.length < 2 || username.length > 40) return res.status(400).json({ error: '用户名需为 2-40 个字符' });
+    const existing = await supabaseAdmin.from('profiles').select('id').eq('username', username).maybeSingle();
+    if (existing.error) throw existing.error;
+    if (existing.data) return res.status(409).json({ code: 'USERNAME_TAKEN', error: '用户名已存在' });
+    const created = await supabaseAdmin.from('profiles').insert({ id: crypto.randomUUID(), username }).select('id,username,avatar_url,user_type,created_at').single();
+    if (created.error) throw created.error;
+    const rawToken = sessionToken();
+    const saved = await supabaseAdmin.from('sessions').insert({ id: crypto.randomUUID(), user_id: created.data.id, token: tokenHash(rawToken), expires_at: sessionExpiry() });
+    if (saved.error) throw saved.error;
+    res.status(201).json({ user: { id: created.data.id, username }, token: rawToken });
+  } catch (error) { next(error); }
+});
+router.post('/auth/login', async (req, res, next) => {
+  try {
+    const username = String(req.body?.username || '').normalize('NFKC').trim();
+    if (username.length < 2 || username.length > 40) return res.status(400).json({ error: '请输入有效用户名' });
+    const found = await supabaseAdmin.from('profiles').select('id,username').eq('username', username).maybeSingle();
+    if (found.error) throw found.error;
+    if (!found.data) return res.status(401).json({ code: 'INVALID_USERNAME', error: '用户名不存在，请先注册' });
+    const rawToken = sessionToken();
+    const saved = await supabaseAdmin.from('sessions').insert({ id: crypto.randomUUID(), user_id: found.data.id, token: tokenHash(rawToken), expires_at: sessionExpiry() });
+    if (saved.error) throw saved.error;
+    res.json({ user: found.data, token: rawToken });
+  } catch (error) { next(error); }
+});
+
 const ensureProfile = async user => {
-  const username = String(user.user_metadata?.username || user.user_metadata?.name || user.email?.split('@')[0] || '夜行者').trim().slice(0, 40);
+  const username = String(user.username || user.profile?.username || '夜行者').trim().slice(0, 40);
   const { data, error } = await supabaseAdmin
     .from('profiles')
     .upsert({ id: user.id, username, updated_at: now() }, { onConflict: 'id' })
@@ -162,7 +198,7 @@ const cloudError = (res, error) => res.status(error.status || 500).json({ error:
 router.get('/auth/me', auth, async (req, res, next) => {
   try {
     const profile = await ensureProfile(req.authUser);
-    res.json({ user: { id: req.authUser.id, email: req.authUser.email }, profile });
+    res.json({ user: { id: req.authUser.id, username: req.authUser.username }, profile });
   } catch (error) { next(error); }
 });
 
